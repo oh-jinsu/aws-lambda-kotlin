@@ -1,3 +1,3 @@
 
-rootProject.name = "aws-lambda-koltin"
+rootProject.name = "aws-lambda-kotlin"
 
