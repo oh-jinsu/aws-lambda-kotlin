@@ -1,0 +1,108 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+    paths:
+      - src/**/*
+      - package*.json
+      - Dockerfile
+      - .github/**/*
+
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      NODE_ENV: ${{ github.ref_name == 'main' && 'production' || 'development' }}
+      APPLICATION_NAME: ${{ github.event.repository.name }}-${{ github.ref_name }}
+      CONTAINER_NAME: ${{ github.event.repository.name }}-${{ github.ref_name }}:${{ github.sha }}
+      ECR_PREFIX: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Test with Gradle
+        run: gradle test
+
+      - name: Build with Gradle
+        run: gradle shadowjar
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Make the ECR repository if it does not exist
+        run: aws ecr describe-repositories --repository-names ${{ env.APPLICATION_NAME }} || aws ecr create-repository --repository-name ${{ env.APPLICATION_NAME }} --image-scanning-configuration scanOnPush=true --image-tag-mutability IMMUTABLE
+
+      - name: Build the Docker image
+        run: docker build -t ${{ env.CONTAINER_NAME }} .
+
+      - name: Tag the Docker image
+        run: docker tag ${{ env.CONTAINER_NAME }} ${{ env.ECR_PREFIX }}/${{ env.CONTAINER_NAME }}
+
+      - name: Push the Docker image
+        run: docker push ${{ env.ECR_PREFIX }}/${{ env.CONTAINER_NAME }}
+
+      - name: Check if the Lambda function exists
+        id: lambdaExists
+        run: aws lambda get-function --function-name ${{ env.APPLICATION_NAME }}
+        continue-on-error: true
+
+      - name: Check if the role exists
+        id: roleExists
+        if: steps.lambdaExists.outcome == 'failure'
+        run: aws iam get-role --role-name lambda-${{ env.APPLICATION_NAME }}
+        continue-on-error: true
+
+      - name: Create new role if Role does not exist
+        if: steps.lambdaExists.outcome == 'failure' && steps.roleExists.outcome == 'failure'
+        run: >
+          aws iam create-role --role-name lambda-${{ env.APPLICATION_NAME }} --assume-role-policy-document '{ "Version": "2012-10-17", "Statement": [{ "Effect": "Allow", "Principal": { "Service": "lambda.amazonaws.com" }, "Action": "sts:AssumeRole" }]}' && sleep 30s
+
+      - name: Attach the basic execution role
+        if: steps.lambdaExists.outcome == 'failure' && steps.roleExists.outcome == 'failure'
+        run: aws iam attach-role-policy --role-name lambda-${{ env.APPLICATION_NAME }} --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+      - name: Attach the DynamoDB full access policy
+        if: steps.lambdaExists.outcome == 'failure' && steps.roleExists.outcome == 'failure'
+        run: aws iam attach-role-policy --role-name lambda-${{ env.APPLICATION_NAME }} --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+
+      - name: Attach the EventBridge full access policy
+        if: steps.lambdaExists.outcome == 'failure' && steps.roleExists.outcome == 'failure'
+        run: aws iam attach-role-policy --role-name lambda-${{ env.APPLICATION_NAME }} --policy-arn arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess
+
+      - name: Create the Lambda function if the Lambda function does not exist
+        if: steps.lambdaExists.outcome == 'failure'
+        run: aws lambda create-function --function-name ${{ env.APPLICATION_NAME }} --code ImageUri=${{ env.ECR_PREFIX }}/${{ env.CONTAINER_NAME }} --package-type Image --role arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/lambda-${{ env.APPLICATION_NAME }}
+
+      - name: Set the env values if the Lambda does not exists
+        if: steps.lambdaExists.outcome == 'failure'
+        run: >
+          sleep 30s &&
+          aws lambda update-function-configuration 
+          --function-name ${{ env.APPLICATION_NAME }} 
+          --environment "Variables={
+            NODE_ENV=${{ env.NODE_ENV }},
+          }"
+
+      - name: Update the Lambda function if the Lambda function does exist
+        if: steps.lambdaExists.outcome == 'success'
+        run: aws lambda update-function-code --function-name ${{ env.APPLICATION_NAME }} --image-uri ${{ env.ECR_PREFIX }}/${{ env.CONTAINER_NAME }}
